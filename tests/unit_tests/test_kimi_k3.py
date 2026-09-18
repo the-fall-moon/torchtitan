@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import BlockMask
 
 from torchtitan.models.kimi_k3 import _kimi_k3_config, _vision_encoder_config
+from torchtitan.tools.utils import device_type
 from torchtitan.models.kimi_k3.kda import KimiKDAKernel
 from torchtitan.models.kimi_k3.model import KimiK3Model
 from torchtitan.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
@@ -125,7 +126,7 @@ class TestKimiK3(unittest.TestCase):
         attention_masks = model.get_attention_masks(positions)
         self.assertIsInstance(attention_masks, BlockMask)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "FLA KDA kernel requires CUDA.")
+    @unittest.skipIf(device_type == "cpu", "FLA KDA kernel requires an accelerator.")
     def test_fla_kda_kernel_matches_recurrent_reference(self):
         torch.manual_seed(1)
         head_dim = 64
@@ -134,14 +135,14 @@ class TestKimiK3(unittest.TestCase):
         def parameter(*shape: int) -> torch.Tensor:
             return torch.randn(
                 *shape,
-                device="cuda",
+                device=device_type,
                 dtype=torch.bfloat16,
                 requires_grad=True,
             )
 
         for lower_bound in (-5.0, None):
             with self.subTest(lower_bound=lower_bound):
-                A_log_H = torch.rand(num_heads, device="cuda")
+                A_log_H = torch.rand(num_heads, device=device_type)
                 A_log_H = A_log_H.uniform_(1.0, 16.0).log().requires_grad_()
                 actual_inputs = (
                     parameter(2, 64, num_heads, head_dim),
