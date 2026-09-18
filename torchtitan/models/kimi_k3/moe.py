@@ -56,6 +56,57 @@ class KimiFeedForward(FeedForward):
         )
 
 
+class _NPUGMM(torch.autograd.Function):
+    """npu_grouped_matmul behind an explicit autograd.Function.
+
+    A bare torch.ops.npu.npu_grouped_matmul call records gradients through
+    autograd's fallback machinery, which is not replay-stable under
+    torch.utils.checkpoint on Ascend ("aten.lift_fresh ... not found in
+    storage" during activation-checkpoint backward). Wrapping the op in an
+    explicit Function with a hand-written backward makes the checkpoint
+    replay well-defined: forward calls the kernel, backward splits the
+    incoming gradient along the per-expert offsets (the reverse of the
+    forward's concatenation).
+    """
+
+    @staticmethod
+    def forward(ctx, A, B_t, offs):
+        import torch_npu  # noqa: F401  (lazy: absent on GPU/CPU-only boxes)
+
+        weights = [B_t[i] for i in range(B_t.shape[0])]
+        outs = torch_npu.npu_grouped_matmul(
+            [A],
+            weights,
+            group_list=offs.tolist(),
+            group_type=0,
+            split_item=0,
+        )
+        ctx.offs = offs
+        ctx.save_for_backward(A, B_t)
+        return torch.cat(outs, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        # out_i = A[offs_i:offs_{i+1}] @ B_t[i]  (B_t is [E, K, N])
+        # dA = cat_i(grad_out_i @ B_t[i].T) along rows
+        # dB_t[i] = A[offs_i:offs_{i+1}].T @ grad_out_i
+        A, B_t = ctx.saved_tensors
+        offs = [int(x) for x in ctx.offs.tolist()]
+        dA_parts = []
+        dB_t_parts = []
+        begin = 0
+        for i, end in enumerate(offs):
+            block = grad_out[begin:end]  # [m_i, N]
+            a_block = A[begin:end]  # [m_i, K]
+            dA_parts.append(block @ B_t[i].T)
+            dB_t_parts.append(a_block.T @ block)
+            begin = end
+        return torch.cat(dA_parts, dim=0), torch.stack(dB_t_parts, dim=0), None
+
+
+_npu_gmm = _NPUGMM.apply
+
+
 class KimiGroupedExperts(GroupedExperts):
     """``common/moe.py::GroupedExperts`` with Kimi's SiTU activation."""
 
@@ -68,6 +119,18 @@ class KimiGroupedExperts(GroupedExperts):
         super().__init__(config)
         self.beta = config.beta
         self.linear_beta = config.linear_beta
+
+    def _grouped_mm(self, *, A, B_t, offs):
+        """Grouped matmul of ``A @ B_t`` with per-expert token offsets.
+
+        Uses torch_npu's ``npu_grouped_matmul`` (the "npu_gmm" kernel) on
+        Ascend: torch._grouped_mm is CUDA-only. ``B_t`` is ``[E, K, N]`` --
+        split per expert into the list the op expects; ``offs`` is the
+        cumsum of per-expert token counts, passed as a host-side list.
+        """
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return _npu_gmm(A, B_t, offs)
+        return super()._grouped_mm(A=A, B_t=B_t, offs=offs)
 
     def forward(
         self,

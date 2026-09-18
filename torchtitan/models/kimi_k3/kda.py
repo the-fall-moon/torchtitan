@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from fla.ops.kda import chunk_kda
+from torchtitan.models.kimi_k3.npu_kda import npu_chunk_kda as _npu_chunk_kda
 from torch import nn
 
 from torchtitan.models.common import Conv1d, Linear
@@ -67,7 +67,7 @@ class KimiKDAKernel(Module):
         A_log_H: torch.Tensor,
         dt_bias_HK: torch.Tensor,
     ) -> torch.Tensor:
-        out_BLHV, _ = chunk_kda(
+        out_BLHV, _ = _npu_chunk_kda(
             q_BLHK,
             k_BLHK,
             v_BLHV,

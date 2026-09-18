@@ -6,6 +6,8 @@
 
 from dataclasses import replace
 
+import torch
+
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.data import GrainDataLoader, SingleDatasetConfig
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
@@ -14,6 +16,8 @@ from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
 from torchtitan.components.tokenizer import MultiModalTokenizer
 from torchtitan.config import ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
+
+
 from torchtitan.hf_datasets.multimodal.mm_collator import MultiModalCollator
 from torchtitan.hf_datasets.multimodal.mm_datasets import (
     MM_DATASETS,
@@ -92,5 +96,15 @@ def kimi_k3_debugmodel() -> Trainer.Config:
             interval=10,
             last_save_model_only=False,
         ),
-        activation_checkpoint=SelectiveAC.Config(),
+        # Activation checkpointing is disabled for kimi_k3 on Ascend:
+        # torch 2.15's selective-checkpoint policy cannot apply save/recompute
+        # decisions to torch_npu's custom ops (npu_grouped_matmul is not
+        # registered checkpointable), so recomputing the npu_gmm region during
+        # backward raises "aten.lift_fresh ... not found in storage" on NPU.
+        # The op is wrapped in an explicit autograd.Function (correct grads,
+        # stable under torch.utils.checkpoint), but the per-op policy still
+        # cannot exempt it; per-region policies (torch_remat, used by newer
+        # torchtitan) or an upstream torch_npu fix are the proper solutions.
+        # Debugmodel memory stays at ~10 GiB without AC.
+        activation_checkpoint=None,
     )
