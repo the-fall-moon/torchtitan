@@ -26,7 +26,7 @@ from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
-from .kda import KimiDeltaAttention, KimiKDAKernel, KimiRMSNormGated
+from .kda import KimiDeltaAttention, KimiKDAKernel, KimiRMSNormGated, KimiShortConvolution
 from .model import KimiK3Model, KimiK3TransformerBlock, KimiMLAAttention
 from .moe import KimiFeedForward, KimiGroupedExperts, KimiLatentMoE
 from .parallelize import parallelize_kimi_k3
@@ -173,14 +173,14 @@ def _kda_config(
 ) -> KimiDeltaAttention.Config:
     projection_dim = num_heads * head_dim
 
-    def conv() -> Conv1d.Config:
-        return Conv1d.Config(
-            in_channels=projection_dim,
-            out_channels=projection_dim,
+    def conv() -> KimiShortConvolution.Config:
+        # FLA's ShortConvolution is a depthwise causal conv with a fused
+        # SiLU, matching the released Kimi K3 HF implementation; the
+        # init is overwritten identically to the reference _CONV_INIT.
+        return KimiShortConvolution.Config(
+            hidden_size=projection_dim,
             kernel_size=conv_kernel_size,
-            groups=projection_dim,
-            bias=False,
-            param_init=_CONV_INIT,
+            activation="silu",
         )
 
     return KimiDeltaAttention.Config(

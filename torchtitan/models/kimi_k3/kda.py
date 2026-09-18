@@ -9,11 +9,13 @@
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
-from torchtitan.models.kimi_k3.npu_kda import npu_chunk_kda as _npu_chunk_kda
+from fla.modules import ShortConvolution as _FLA_ShortConvolution
+from fla.modules.conv.causal_conv1d import causal_conv1d as _fla_causal_conv1d
+from fla.modules.fused_norm_gate import rms_norm_gated as _fla_rms_norm_gated
 from torch import nn
 
-from torchtitan.models.common import Conv1d, Linear
+from torchtitan.models.common import Linear
+from torchtitan.models.kimi_k3.npu_kda import npu_chunk_kda as _npu_chunk_kda
 from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.protocols.module import Module
 
@@ -36,12 +38,50 @@ class KimiRMSNormGated(Module):
         self.weight = nn.Parameter(torch.empty(config.dim))
 
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        x_float = x.float()
-        variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-        x_float = x_float * torch.rsqrt(variance + self.eps)
-        x_float = self.weight.float() * x_float
-        return (x_float * torch.sigmoid(gate.float())).to(input_dtype)
+        return _fla_rms_norm_gated(
+            x,
+            gate,
+            self.weight,
+            None,
+            activation="sigmoid",
+            eps=self.eps,
+        )
+
+
+class KimiShortConvolution(_FLA_ShortConvolution, Module):
+    """KDA short causal convolution backed by FLA's fused kernel.
+
+    Mirrors the released Kimi K3 HF model, which builds FLA's
+    ``ShortConvolution`` per q/k/v projection. Inputs are the packed-token
+    2D layout ``(T, D)``; the Triton kernel runs on NPU via fla's
+    triton_ascend backend.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        hidden_size: int
+        kernel_size: int
+        activation: str = "silu"
+
+    def __init__(self, config: Config):
+        super().__init__(
+            hidden_size=config.hidden_size,
+            kernel_size=config.kernel_size,
+            activation=config.activation,
+        )
+
+    def forward(
+        self,
+        x_TD: torch.Tensor,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, None]:
+        y_TD, _ = _fla_causal_conv1d(
+            x=x_TD.unsqueeze(0),
+            weight=self.weight.squeeze(1),
+            activation=self.activation,
+            backend=self.backend,
+        )
+        return y_TD.squeeze(0), None
 
 
 class KimiKDAKernel(Module):
@@ -94,9 +134,9 @@ class KimiDeltaAttention(Module):
         q_proj: Linear.Config
         k_proj: Linear.Config
         v_proj: Linear.Config
-        q_conv: Conv1d.Config
-        k_conv: Conv1d.Config
-        v_conv: Conv1d.Config
+        q_conv: KimiShortConvolution.Config
+        k_conv: KimiShortConvolution.Config
+        v_conv: KimiShortConvolution.Config
         forget_a: Linear.Config
         forget_b: Linear.Config
         beta: Linear.Config
@@ -128,10 +168,6 @@ class KimiDeltaAttention(Module):
         self.A_log = nn.Parameter(torch.empty(config.num_heads))
         self.dt_bias = nn.Parameter(torch.empty(config.num_heads, config.head_dim))
 
-    def _causal_conv(self, x_TC: torch.Tensor, conv: Conv1d) -> torch.Tensor:
-        x_1CT = F.pad(x_TC.T.unsqueeze(0), (self.conv_kernel_size - 1, 0))
-        return F.silu(conv(x_1CT)).squeeze(0).T
-
     def forward(
         self,
         x_TD: torch.Tensor,
@@ -145,13 +181,13 @@ class KimiDeltaAttention(Module):
             )
 
         num_tokens = x_TD.shape[0]
-        q_THK = self._causal_conv(self.q_proj(x_TD), self.q_conv).view(
+        q_THK = self.q_conv(self.q_proj(x_TD))[0].view(
             num_tokens, self.num_heads, self.head_dim
         )
-        k_THK = self._causal_conv(self.k_proj(x_TD), self.k_conv).view(
+        k_THK = self.k_conv(self.k_proj(x_TD))[0].view(
             num_tokens, self.num_heads, self.head_dim
         )
-        v_THV = self._causal_conv(self.v_proj(x_TD), self.v_conv).view(
+        v_THV = self.v_conv(self.v_proj(x_TD))[0].view(
             num_tokens, self.num_heads, self.head_dim
         )
         forget_THK = self.forget_b(self.forget_a(x_TD)).view(
