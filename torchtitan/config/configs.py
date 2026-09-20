@@ -326,7 +326,7 @@ class CommConfig:
     usually a tighter bound than during initialization.
     """
 
-    trace_buf_size: int = 20000
+    trace_buf_size: int = 0
     """Flight recorder ring buffer size, >0 means recording by default, 0 means disabled"""
 
     save_traces_folder: str = "comm_traces"
