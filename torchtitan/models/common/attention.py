@@ -255,10 +255,7 @@ class FlexAttention(Module):
     }
 
     # pyrefly: ignore[no-matching-overload]
-    _compiled_flex_attn: ClassVar[Callable] = torch.compile(
-        flex_attention,
-        options=inductor_configs,
-    )
+    _compiled_flex_attn: ClassVar[Callable] = flex_attention
 
     def __init__(self, config: Config) -> None:
         super().__init__()
