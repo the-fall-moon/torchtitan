@@ -18,6 +18,7 @@ add more if a new callsite needs them.
 
 from dataclasses import dataclass
 
+import torch
 import torch.nn as nn
 
 from torchtitan.protocols.module import Module
@@ -146,6 +147,16 @@ class RMSNorm(nn.RMSNorm, Module):
             eps=config.eps,
             elementwise_affine=config.elementwise_affine,
         )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.weight is not None and x.device.type == "npu":
+            # torch_npu's fused kernel is ~2.2x faster than the eager fp32
+            # composition on Ascend (numerically identical, cos=1.0 -- see
+            # the migration package's FUSED_OPS_PERF_LOG.md section 3.7).
+            import torch_npu
+
+            return torch_npu.npu_rms_norm(x, self.weight, self.eps)[0]
+        return super().forward(x)
 
 
 class SiLU(nn.SiLU, Module):

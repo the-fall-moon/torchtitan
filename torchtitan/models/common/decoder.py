@@ -12,6 +12,8 @@ import torch
 from torch.nn.attention.flex_attention import _mask_mod_signature, and_masks, BlockMask
 
 from torchtitan.distributed.utils import is_in_batch_invariant_mode
+from torch.nn.attention.flex_attention import and_masks, create_mask
+
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
@@ -20,6 +22,7 @@ from torchtitan.models.common.attention import (
     FlexAttention,
     get_causal_mask_mod,
     get_efficient_causal_mask_mod_for_packed_document,
+    NpuFusionAttention,
     ScaledDotProductAttention,
     VarlenAttention,
 )
@@ -357,8 +360,36 @@ class Decoder(BaseModel):
             return self._create_flex_attention_mask_for_document(positions, attn_config)
         elif isinstance(inner_attn, VarlenAttention.Config):
             return create_varlen_metadata_for_document(positions)
+        elif isinstance(inner_attn, NpuFusionAttention.Config):
+            return self._create_npu_fusion_attention_mask_for_document(
+                positions, attn_config
+            )
         else:
             raise TypeError(
                 f"Only VarlenAttention and FlexAttention support attention masks, "
                 f"got {type(inner_attn).__name__}"
             )
+
+    def _create_npu_fusion_attention_mask_for_document(
+        self,
+        positions: torch.Tensor,
+        attn_config: BaseAttention.Config,
+    ) -> torch.Tensor:
+        """Build the bool [T, T] NFA mask (True = masked out) from the same
+        causal + packed-document mask_mods as the flex path, via torch's
+        eager ``create_mask`` (BlockMask.to_dense() on this torch build
+        returns a block-level grid, unusable for an exact token mask)."""
+        del attn_config
+        seq_len = positions.shape[0]
+        keep_BHTT = create_mask(
+            and_masks(
+                get_causal_mask_mod(),
+                get_efficient_causal_mask_mod_for_packed_document(positions),
+            ),
+            1,
+            None,
+            seq_len,
+            seq_len,
+            device=positions.device,
+        )
+        return ~keep_BHTT.squeeze(0).squeeze(0)

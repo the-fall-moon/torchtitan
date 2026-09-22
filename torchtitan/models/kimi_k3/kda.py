@@ -9,13 +9,12 @@
 from dataclasses import dataclass
 
 import torch
-from fla.modules import ShortConvolution as _FLA_ShortConvolution
-from fla.modules.conv.causal_conv1d import causal_conv1d as _fla_causal_conv1d
-from fla.modules.fused_norm_gate import rms_norm_gated as _fla_rms_norm_gated
+from fla.modules import ShortConvolution
+from fla.modules.fused_norm_gate import rms_norm_gated
 from torch import nn
 
 from torchtitan.models.common import Linear
-from torchtitan.models.kimi_k3.npu_kda import npu_chunk_kda as _npu_chunk_kda
+from torchtitan.models.kimi_k3.npu_kda import npu_chunk_kda
 from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.protocols.module import Module
 
@@ -38,7 +37,7 @@ class KimiRMSNormGated(Module):
         self.weight = nn.Parameter(torch.empty(config.dim))
 
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        return _fla_rms_norm_gated(
+        return rms_norm_gated(
             x,
             gate,
             self.weight,
@@ -48,7 +47,7 @@ class KimiRMSNormGated(Module):
         )
 
 
-class KimiShortConvolution(_FLA_ShortConvolution, Module):
+class KimiShortConvolution(ShortConvolution, Module):
     """KDA short causal convolution backed by FLA's fused kernel.
 
     Mirrors the released Kimi K3 HF model, which builds FLA's
@@ -75,13 +74,18 @@ class KimiShortConvolution(_FLA_ShortConvolution, Module):
         x_TD: torch.Tensor,
         **kwargs: object,
     ) -> tuple[torch.Tensor, None]:
-        y_TD, _ = _fla_causal_conv1d(
-            x=x_TD.unsqueeze(0),
-            weight=self.weight.squeeze(1),
-            activation=self.activation,
-            backend=self.backend,
+        # Eager depthwise causal conv (pad + depthwise conv1d + SiLU). FLA's
+        # triton causal_conv1d measures 1.5-3x slower than this eager form on
+        # Ascend 910B2 across T=256..4096 (see the migration package's
+        # FUSED_OPS_PERF_LOG.md section 3.3).
+        weight_C1K = self.weight  # [C, 1, K], depthwise
+        kernel_size = weight_C1K.shape[-1]
+        x_1CT = torch.nn.functional.pad(x_TD.T.unsqueeze(0), (kernel_size - 1, 0))
+        y_1CT = torch.nn.functional.conv1d(
+            x_1CT, weight_C1K, self.bias, groups=weight_C1K.shape[0]
         )
-        return y_TD.squeeze(0), None
+        y_TD = torch.nn.functional.silu(y_1CT).squeeze(0).T
+        return y_TD, None
 
 
 class KimiKDAKernel(Module):
@@ -107,7 +111,7 @@ class KimiKDAKernel(Module):
         A_log_H: torch.Tensor,
         dt_bias_HK: torch.Tensor,
     ) -> torch.Tensor:
-        out_BLHV, _ = _npu_chunk_kda(
+        out_BLHV, _ = npu_chunk_kda(
             q_BLHK,
             k_BLHK,
             v_BLHV,

@@ -34,6 +34,7 @@ from torch.nn.attention.flex_attention import (
     AuxRequest,
     BlockMask,
     create_block_mask,
+    create_mask,
     flex_attention,
 )
 from torch.nn.attention.varlen import AuxRequest as VarlenAuxRequest, varlen_attn
@@ -52,6 +53,7 @@ __all__ = [
     "BaseQKVLinear",
     "FusedQKVLinear",
     "GQAttention",
+    "NpuFusionAttention",
     "QKVLinear",
     "ScaledDotProductAttention",
     "VarlenAttention",
@@ -955,3 +957,80 @@ class GQAttention(BaseAttention):
         ).contiguous()
         out_TD = out_TNH.view(out_TNH.shape[0], -1)
         return self.wo(out_TD)
+
+
+class NpuFusionAttention(Module):
+    """Inner attention backed by ``torch_npu.npu_fusion_attention`` (NFA).
+
+    On Ascend, eager flex_attention materializes the full scores matrix in an
+    unfused implementation and is 9-18x slower than NFA at MLA shapes (see
+    the migration package's FUSED_OPS_PERF_LOG.md section 3.6).
+
+    NFA constraints on CANN 9.2.0 that shape this module:
+    - The TND varlen layout ignores ``sparse_mode`` entirely (only
+      bidirectional attention), so causal attention uses the BNSD layout plus
+      an explicit boolean mask where ``True`` means masked out (opposite of
+      the SDPA keep convention).
+    - The value head dim must equal the query head dim, so ``v`` is padded
+      and the output sliced back.
+
+    ``Decoder.get_attention_masks`` supplies the [T, T] bool mask (True =
+    masked out) built from the same causal + packed-document mask_mods as the
+    flex path; ``None`` means plain causal.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        pass
+
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+
+    def forward(
+        self,
+        q_TNH: torch.Tensor,
+        k_TNH: torch.Tensor,
+        v_TNH: torch.Tensor,
+        *,
+        attention_masks: torch.Tensor | None = None,
+        scale: float | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        import torch_npu  # lazy: absent on GPU/CPU-only boxes
+
+        num_tokens, n_heads, q_head_dim = q_TNH.shape
+        v_head_dim = v_TNH.shape[-1]
+        if isinstance(q_TNH, DTensor):
+            q_TNH = q_TNH.to_local()
+            assert isinstance(k_TNH, DTensor)
+            k_TNH = k_TNH.to_local()
+            assert isinstance(v_TNH, DTensor)
+            v_TNH = v_TNH.to_local()
+        if attention_masks is None:
+            # bool [T, T], True = masked out (upper triangle)
+            attention_masks = ~torch.ones(
+                num_tokens, num_tokens, dtype=torch.bool, device=q_TNH.device
+            ).tril()
+
+        # BNSD: [1, H, T, D]; NFA requires v_head_dim == q_head_dim.
+        q_BNHD = q_TNH.transpose(0, 1).unsqueeze(0).contiguous()
+        k_BNHD = k_TNH.transpose(0, 1).unsqueeze(0).contiguous()
+        v_BNHD = (
+            torch.nn.functional.pad(v_TNH, (0, q_head_dim - v_head_dim))
+            .transpose(0, 1)
+            .unsqueeze(0)
+            .contiguous()
+        )
+        out_BNHD = torch_npu.npu_fusion_attention(
+            q_BNHD,
+            k_BNHD,
+            v_BNHD,
+            head_num=n_heads,
+            pse=None,
+            atten_mask=attention_masks,
+            scale=scale if scale is not None else q_head_dim**-0.5,
+            keep_prob=1,
+            input_layout="BNSD",
+            sparse_mode=0,
+        )[0]
+        return out_BNHD[..., :v_head_dim].squeeze(0).transpose(0, 1)

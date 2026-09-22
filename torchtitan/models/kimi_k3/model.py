@@ -7,7 +7,6 @@
 from dataclasses import dataclass, field
 
 import torch
-from fla.ops.attnres import fused_attnres as _fla_fused_attnres
 from torch import nn
 
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
@@ -129,36 +128,47 @@ class KimiMLAAttention(BaseAttention):
         return self.wo(out_TD)
 
 
+try:
+    import cann_ops_transformer  # noqa: F401  (ops-transformer attn_res; Ascend-only)
+
+    _CANN_OPS_TRANSFORMER_AVAILABLE = True
+except ImportError:
+    _CANN_OPS_TRANSFORMER_AVAILABLE = False
+
+
 def _apply_attention_residual(
     prefix_sum_TD: torch.Tensor,
     block_residual_TND: torch.Tensor,
     projection: Linear,
     norm: RMSNorm,
 ) -> torch.Tensor:
-    """Apply Kimi's block-level attention residual with FLA's fused kernel.
+    """Apply Kimi's block-level attention residual.
 
-    The block residuals come first (index 0..N-1) and the running prefix sum is
-    the last residual source, matching the released eager concatenation order.
-    FLA's ``fused_attnres`` computes the per-source RMSNorm key normalization
-    and the depth softmax in fp32, same as the eager reference. It runs on
-    NPU via fla's triton_ascend backend.
+    On Ascend with the standalone ops-transformer package installed, the
+    "normalize + score + softmax-weighted combine" runs as one AscendC fused
+    kernel, 1.4-5.4x faster than the eager fp32 composition (see the
+    migration package's FUSED_OPS_PERF_LOG.md section 3.2). The eager
+    composition below matches the 5fecad929 baseline (fla's fused_attnres
+    triton kernel measured 7-14x SLOWER than eager on 910B2 and is not used).
 
     TODO: Add TP Support. The current implementation assumes that the input tensors are on a single device.
     """
     assert norm.eps is not None
 
-    residuals = [
-        block_residual_TND[:, i, :].contiguous()
-        for i in range(block_residual_TND.shape[1])
-    ]
-    residuals.append(prefix_sum_TD)
-    return _fla_fused_attnres(
-        query=projection.weight.squeeze(0),
-        residuals=residuals,
-        rms_weight=norm.weight,
-        rms_eps=norm.eps,
-        scale=1.0,
-    )
+    if _CANN_OPS_TRANSFORMER_AVAILABLE and prefix_sum_TD.device.type == "npu":
+        return cann_ops_transformer.block_attention_residuals(
+            prefix_sum_TD, block_residual_TND, projection.weight, norm.weight
+        )
+
+    values_TND = torch.cat((block_residual_TND, prefix_sum_TD.unsqueeze(1)), dim=1)
+    values_float = values_TND.float()
+    variance = values_float.pow(2).mean(dim=-1, keepdim=True)
+    keys_TND = values_float * torch.rsqrt(variance + norm.eps)
+    score_weight_D = norm.weight.float() * projection.weight.squeeze(0).float()
+    scores_TN = (keys_TND * score_weight_D).sum(dim=-1)
+    probs_T1N = torch.softmax(scores_TN, dim=-1).unsqueeze(1)
+    output_TD = torch.matmul(probs_T1N, values_float).squeeze(1)
+    return output_TD.to(values_TND.dtype)
 
 
 class KimiK3TransformerBlock(Module):

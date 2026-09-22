@@ -12,6 +12,7 @@ import torch.nn as nn
 
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.models.common import Conv1d, Embedding, Linear
+from torchtitan.models.common.attention import NpuFusionAttention
 from torchtitan.models.common.config_utils import get_attention_config
 from torchtitan.models.common.moe import RoutedExperts, TokenChoiceTopKRouter
 from torchtitan.models.common.nn_modules import GELU, RMSNorm
@@ -140,6 +141,11 @@ def _mla_config(
     attn_backend: str,
 ) -> KimiMLAAttention.Config:
     inner_attention = get_attention_config(attn_backend)
+    if attn_backend == "flex" and hasattr(torch, "npu") and torch.npu.is_available():
+        # Ascend: eager flex_attention materializes the full scores matrix and
+        # is 9-18x slower than npu_fusion_attention at MLA shapes (see the
+        # migration package's FUSED_OPS_PERF_LOG.md section 3.6).
+        inner_attention = NpuFusionAttention.Config()
 
     q_head_dim = qk_nope_head_dim + qk_rope_head_dim
     return KimiMLAAttention.Config(

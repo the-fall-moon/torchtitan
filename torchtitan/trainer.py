@@ -50,7 +50,11 @@ from torchtitan.distributed.cudagraph import (
     wrap_with_cuda_graph,
 )
 from torchtitan.distributed.spmd_types import annotate_input_spmd_types
-from torchtitan.models.common.attention import FlexAttention, VarlenAttention
+from torchtitan.models.common.attention import (
+    FlexAttention,
+    NpuFusionAttention,
+    VarlenAttention,
+)
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.token_dispatcher import (
     HybridEPTokenDispatcher,
@@ -715,7 +719,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         if isinstance(self.model_config, Decoder.Config) and positions is not None:
             attention_backend = self.model_config.first_full_attention_backend
             if isinstance(
-                attention_backend, (FlexAttention.Config, VarlenAttention.Config)
+                attention_backend,
+                (FlexAttention.Config, VarlenAttention.Config, NpuFusionAttention.Config),
             ):
                 model = cast(Decoder, self.model_parts[0])
                 extra_kwargs["attention_masks"] = model.get_attention_masks(
